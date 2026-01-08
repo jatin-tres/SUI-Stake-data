@@ -18,10 +18,13 @@ RPC_NODES = [
 ]
 
 def make_rpc_call(method, params):
+    """
+    Standard RPC handler with Node Rotation.
+    """
     for node in RPC_NODES:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
-            response = requests.post(node, json=payload, headers=HEADERS, timeout=10)
+            response = requests.post(node, json=payload, headers=HEADERS, timeout=15)
             if response.status_code == 200:
                 data = response.json()
                 if "result" in data:
@@ -32,7 +35,7 @@ def make_rpc_call(method, params):
 
 def get_validator_map():
     """
-    Downloads the official list. Returns empty dict {} if failed (Prevent Crash).
+    Downloads Phonebook. Returns empty dict if blocked (Offline Mode).
     """
     validator_map = {}
     try:
@@ -41,57 +44,40 @@ def get_validator_map():
             for v in result.get('activeValidators', []):
                 validator_map[v['suiAddress'].lower()] = v['name']
     except:
-        pass # Fail silently, we will use Blind Mode
+        pass
     return validator_map
 
-def parse_transaction(tx_hash, validator_map, target_keyword):
-    # 1. SAFETY FIX: Ensure map is never None
-    if validator_map is None:
-        validator_map = {}
-
-    tx_data = make_rpc_call(
-        "sui_getTransactionBlock", 
-        [tx_hash, {"showEvents": True, "showBalanceChanges": True}]
-    )
-    
-    if not tx_data:
-        return "Network Error", "Server blocked request"
-
+def parse_single_block(block_data, validator_map, target_keyword):
+    """
+    Logic to extract amount from a single transaction block data.
+    """
+    if not block_data:
+        return None, "Network Error (Details missing)"
+        
     target_clean = target_keyword.lower()
     found_items = []
-
-    # 2. Search EVENTS
-    events = tx_data.get('events', [])
+    
+    # 1. Search EVENTS
+    events = block_data.get('events', [])
     for event in events:
         parsed = event.get('parsedJson', {})
-        
-        # We look for ANY event that has a validator address
         if 'validator_address' in parsed:
             val_addr = parsed.get('validator_address', '').lower()
             amount_mist = float(parsed.get('amount', 0))
             amount_sui = amount_mist / 1_000_000_000
             
-            # RESOLVE NAME
             val_name = validator_map.get(val_addr, "Unknown")
-            
-            # Backup: Check for Nansen prefix based on your screenshot
+            # Detect Nansen manually if phonebook failed
             if "0xa36a" in val_addr:
-                val_name = "Nansen (Likely)"
+                val_name = "Nansen (Detected)"
 
-            # LOGIC:
-            # 1. If name matches Nansen -> Return immediately
-            # 2. If name is Unknown -> Save it as a backup (Blind Mode)
-            
-            match_found = target_clean in val_name.lower()
-            
-            if match_found:
+            if target_clean in val_name.lower():
                 return -amount_sui, f"✅ Staked to {val_name}"
-            else:
-                # Save non-matching result just in case the phonebook failed
-                found_items.append((-amount_sui, f"❓ Staked to {val_name} ({val_addr[:6]}...)"))
+            
+            found_items.append((-amount_sui, f"❓ Staked to {val_name}"))
 
-    # 3. Search BALANCE CHANGES (Transfers)
-    for change in tx_data.get('balanceChanges', []):
+    # 2. Search BALANCE CHANGES
+    for change in block_data.get('balanceChanges', []):
         owner_data = change.get('owner', {})
         if isinstance(owner_data, dict):
             owner_addr = owner_data.get('AddressOwner', '').lower()
@@ -104,33 +90,45 @@ def parse_transaction(tx_hash, validator_map, target_keyword):
                 if target_clean in owner_name.lower():
                     return amount_sui, f"✅ Transfer to {owner_name}"
 
-    # 4. BLIND MODE RETURN
-    # If we didn't find "Nansen" specifically, but we found OTHER staking events,
-    # return the first one. This ensures you see the numbers even if the name is missing.
+    # 3. Blind Mode Fallback
     if found_items:
-        amt, note = found_items[0]
-        return amt, f"⚠️ Blind Mode: {note}"
+        return found_items[0][0], f"⚠️ Blind Mode: {found_items[0][1]}"
 
-    return "Not Found", f"No event found for '{target_keyword}'"
+    return None, f"No event found for '{target_keyword}'"
+
+def fetch_batch_transactions(hashes):
+    """
+    TURBO MODE: Fetches multiple transactions in ONE network call.
+    Uses 'sui_multiGetTransactionBlocks'.
+    """
+    # Prepare params: List of Hashes, then Options
+    params = [
+        hashes, 
+        {
+            "showEvents": True, 
+            "showBalanceChanges": True,
+            "showInput": True,
+            "showEffects": True
+        }
+    ]
+    
+    # This returns a LIST of transaction blocks corresponding to the hashes
+    results = make_rpc_call("sui_multiGetTransactionBlocks", params)
+    return results
 
 # --- UI ---
 st.set_page_config(page_title="Sui API Extractor", page_icon="⚡")
-st.title("⚡ Sui Stake Transaction Extractor (Unbreakable)")
+st.title("⚡ Sui Extractor (Turbo Batch Mode)")
 
-# 🛠️ MEMORY FIX: Force clear corrupted data
-if 'v_map' in st.session_state and st.session_state['v_map'] is None:
-    st.session_state['v_map'] = {}
+# Auto-Load Phonebook
+if 'v_map' not in st.session_state:
+    st.session_state['v_map'] = get_validator_map()
 
-# Auto-Load
-if 'v_map' not in st.session_state or not st.session_state['v_map']:
-    with st.spinner("Loading Phonebook..."):
-        st.session_state['v_map'] = get_validator_map()
-    
-    count = len(st.session_state['v_map'])
-    if count > 5:
-        st.success(f"✅ Online: Phonebook loaded ({count} validators).")
-    else:
-        st.warning(f"⚠️ Offline Mode: Phonebook blocked. App will extract RAW addresses.")
+# Status Indicator
+if st.session_state['v_map']:
+    st.success(f"✅ Online Mode: Phonebook loaded ({len(st.session_state['v_map'])} validators).")
+else:
+    st.warning("⚠️ Offline Mode: Phonebook blocked. Using 'Hardcoded Detection' for Nansen.")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
@@ -147,33 +145,63 @@ if uploaded_file:
     with col2:
         target_keyword = st.text_input("Search for Validator", value="Nansen")
     
-    if st.button("🚀 Run Extraction"):
+    if st.button("🚀 Run Turbo Extraction"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        results_amt = []
-        results_notes = []
-        total_rows = len(df)
+        # Prepare Result Lists
+        # We pre-fill them with None so we can assign by index
+        results_amt = [None] * len(df)
+        results_notes = [None] * len(df)
         
-        # 🛠️ SAFETY: Handle both None and Empty Dict
+        # BATCH SETTINGS
+        BATCH_SIZE = 10 # Process 10 rows at a time
+        all_hashes = df[hash_col].astype(str).str.strip().tolist()
         v_map = st.session_state.get('v_map') or {}
 
-        for index, row in df.iterrows():
-            tx_hash = str(row[hash_col]).strip()
+        total_batches = (len(all_hashes) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        for i in range(0, len(all_hashes), BATCH_SIZE):
+            batch_hashes = all_hashes[i : i + BATCH_SIZE]
+            current_batch_idx = i // BATCH_SIZE
             
-            status_text.text(f"Processing {index + 1}/{total_rows}...")
-            progress_bar.progress((index + 1) / total_rows)
+            status_text.text(f"Processing Batch {current_batch_idx + 1}/{total_batches} ({len(batch_hashes)} txs)...")
+            progress_bar.progress((i + 1) / len(all_hashes))
             
-            amount, note = parse_transaction(tx_hash, v_map, target_keyword)
+            # 1. FETCH BATCH
+            batch_data = fetch_batch_transactions(batch_hashes)
             
-            results_amt.append(amount)
-            results_notes.append(note)
+            # 2. PROCESS BATCH
+            if batch_data:
+                # Map results back to order. 
+                # Note: sui_multiGetTransactionBlocks result order usually matches request order, 
+                # but we should handle mismatches if possible. 
+                # For simplicity here, we assume 1:1 mapping or handle lookup.
+                
+                # Create a lookup dict for this batch {digest: data}
+                batch_lookup = {item['digest']: item for item in batch_data if item and 'digest' in item}
+                
+                for j, tx_hash in enumerate(batch_hashes):
+                    global_index = i + j
+                    
+                    if tx_hash in batch_lookup:
+                        amt, note = parse_single_block(batch_lookup[tx_hash], v_map, target_keyword)
+                        results_amt[global_index] = amt
+                        results_notes[global_index] = note
+                    else:
+                        results_amt[global_index] = None
+                        results_notes[global_index] = "Network Error (Batch failed for this Item)"
+            else:
+                # If whole batch failed
+                for j in range(len(batch_hashes)):
+                    results_notes[i+j] = "Network Error (Whole Batch Failed)"
             
-            time.sleep(1.5) # Prevent rate limits
+            # Small sleep between batches is better than sleep between every row
+            time.sleep(1) 
         
         df[f"Amount ({target_keyword})"] = results_amt
         df["Notes"] = results_notes
         
         st.success("✅ Done!")
         st.dataframe(df)
-        st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "sui_results.csv", "text/csv")
+        st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "sui_results_turbo.csv", "text/csv")
