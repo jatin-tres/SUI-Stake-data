@@ -1,6 +1,30 @@
 import streamlit as st
+import os
+import sys
+import subprocess
+import time
+import shutil
+
+# --- 🛠️ SELF-REPAIR BLOCK (Fixes ModuleNotFoundError) ---
+# This forces the server to install libraries if requirements.txt failed
+def install_libs():
+    libs = ["selenium", "webdriver-manager", "beautifulsoup4", "pandas", "openpyxl"]
+    for lib in libs:
+        try:
+            __import__(lib.replace("-", "_")) # basic check
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
+
+try:
+    import selenium
+    from selenium import webdriver
+except ImportError:
+    st.warning("⚙️ First-time setup: Installing missing libraries... (This takes 30s)")
+    install_libs()
+    st.rerun() # Restart app after install
+
+# --- NORMAL IMPORTS ---
 import pandas as pd
-from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -8,9 +32,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
-import time
 import re
-import shutil
 
 # --- CONFIGURATION & SETUP ---
 def get_driver():
@@ -44,7 +66,6 @@ def get_driver():
         driver = webdriver.Chrome(service=service, options=options)
         return driver
     except Exception as e:
-        st.error(f"Failed to launch Chrome: {e}")
         return None
 
 def scrape_suiscan(driver, tx_hash, target_keyword):
@@ -71,7 +92,6 @@ def scrape_suiscan(driver, tx_hash, target_keyword):
         # 2. Try to click "Show more"
         try:
             time.sleep(2.5) # Wait for JS to render
-            # Look for buttons with text similar to "Show more"
             buttons = driver.find_elements(By.XPATH, "//button[contains(translate(text(), 'SHOW', 'show'), 'show more')]")
             
             # Scroll down just in case
@@ -91,7 +111,6 @@ def scrape_suiscan(driver, tx_hash, target_keyword):
         
         # 4. Search logic using Regex
         safe_keyword = re.escape(target_keyword)
-        # Pattern: Number ... SUI ... to ... Keyword
         pattern_str = r"([\-\d\.]+)\s+SUI\s+to\s+" + safe_keyword
         pattern = re.compile(pattern_str, re.IGNORECASE)
         
@@ -152,7 +171,7 @@ if uploaded_file:
             st.error("Please enter a keyword.")
         else:
             status_container = st.empty()
-            status_container.info("Initializing Browser Engine... (This may take 10-20 seconds on Cloud)")
+            status_container.info("Initializing Browser Engine... (This may take 10-20 seconds)")
             
             driver = get_driver()
             
@@ -166,17 +185,14 @@ if uploaded_file:
                 
                 for index, row in df.iterrows():
                     tx_hash = str(row[hash_col]).strip()
-                    
                     status_text.text(f"Scanning {index + 1}/{total_rows}: {tx_hash}")
                     progress_bar.progress((index + 1) / total_rows)
-                    
                     data = scrape_suiscan(driver, tx_hash, target_keyword)
                     results.append(data)
                     time.sleep(1) 
 
                 driver.quit()
                 
-                # Show results
                 results_df = pd.DataFrame(results)
                 final_df = pd.concat([df, results_df.drop(columns=["Transaction Hash"], errors='ignore')], axis=1)
                 
@@ -191,4 +207,5 @@ if uploaded_file:
                     mime='text/csv',
                 )
             else:
-                st.error("Could not initialize the browser driver. Please check logs.")
+                st.error("⚠️ Error: Browser not found. Did you add 'packages.txt'?")
+                st.markdown("**How to fix:** Create a file named `packages.txt` in your repo and add `chromium` inside it.")
