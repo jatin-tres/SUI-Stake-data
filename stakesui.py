@@ -115,7 +115,7 @@ def parse_transaction(tx_hash, validator_map, target_keyword):
 
 # --- UI ---
 st.set_page_config(page_title="Sui API Extractor", page_icon="⚡")
-st.title("⚡ Sui Transaction Extractor (Unbreakable)")
+st.title("⚡ Sui Stake Transaction Extractor (Unbreakable)")
 
 # 🛠️ MEMORY FIX: Force clear corrupted data
 if 'v_map' in st.session_state and st.session_state['v_map'] is None:
