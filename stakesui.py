@@ -4,13 +4,11 @@ import requests
 import time
 
 # --- CONFIGURATION ---
-# 1. Fake User-Agent to avoid blocks
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Content-Type": "application/json"
 }
 
-# 2. Public Nodes (We rotate them)
 RPC_NODES = [
     "https://fullnode.mainnet.sui.io:443",
     "https://sui-rpc.publicnode.com",
@@ -20,9 +18,6 @@ RPC_NODES = [
 ]
 
 def make_rpc_call(method, params):
-    """
-    Tries multiple nodes with a timeout.
-    """
     for node in RPC_NODES:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
@@ -36,28 +31,23 @@ def make_rpc_call(method, params):
     return None
 
 def get_validator_map():
-    """
-    Downloads validator names. Includes a HARDCODED backup for common ones
-    to ensure it works even if the download fails.
-    """
-    # 1. Hardcoded Backup (From your screenshot and common lists)
-    validator_map = {
-        "0xa36a28726514f77c5583547228373153573715364841158652": "Nansen", # Common Nansen Address
-        # Add the specific address from your screenshot if known
-    }
+    # 1. Initialize with empty dict (Safety)
+    validator_map = {}
     
     # 2. Live Download
     result = make_rpc_call("suix_getLatestSuiSystemStateV2", [])
     if result:
         for v in result.get('activeValidators', []):
+            # Map both Address -> Name AND Name -> Address
             validator_map[v['suiAddress'].lower()] = v['name']
             
     return validator_map
 
 def parse_transaction(tx_hash, validator_map, target_keyword):
-    """
-    Looks for ANY event with a validator address matching our keyword.
-    """
+    # SAFETY FIX: If map is None, treat as empty dict to prevent crash
+    if validator_map is None:
+        validator_map = {}
+
     tx_data = make_rpc_call(
         "sui_getTransactionBlock", 
         [tx_hash, {"showEvents": True, "showBalanceChanges": True}]
@@ -68,33 +58,29 @@ def parse_transaction(tx_hash, validator_map, target_keyword):
 
     target_clean = target_keyword.lower()
     
-    # 1. Search EVENTS (Fixed Logic)
+    # 1. Search EVENTS
     events = tx_data.get('events', [])
     for event in events:
         parsed = event.get('parsedJson', {})
-        
-        # KEY FIX: We don't check event "type" string anymore.
-        # We just check: Does this event have a 'validator_address' field?
         if 'validator_address' in parsed:
             val_addr = parsed.get('validator_address', '').lower()
             amount_mist = float(parsed.get('amount', 0))
             
             # Lookup Name
-            val_name = validator_map.get(val_addr, "Unknown")
+            val_name = validator_map.get(val_addr, f"Unknown ({val_addr[:6]}...)")
             
-            # Check Match
             if target_clean in val_name.lower():
                 amount_sui = amount_mist / 1_000_000_000
-                # Staking is usually negative (sending money out)
                 return -amount_sui, f"✅ Staked to {val_name}"
 
-    # 2. Search Balance Changes (Transfers)
+    # 2. Search Balance Changes
     for change in tx_data.get('balanceChanges', []):
         owner_data = change.get('owner', {})
         if isinstance(owner_data, dict):
             owner_addr = owner_data.get('AddressOwner', '').lower()
             if owner_addr:
-                owner_name = validator_map.get(owner_addr, "")
+                owner_name = validator_map.get(owner_addr, f"Unknown ({owner_addr[:6]}...)")
+                
                 if target_clean in owner_name.lower():
                     amount_mist = float(change.get('amount', 0))
                     if amount_mist < 0:
@@ -104,16 +90,21 @@ def parse_transaction(tx_hash, validator_map, target_keyword):
 
 # --- UI ---
 st.set_page_config(page_title="Sui API Extractor", page_icon="⚡")
-st.title("⚡ Sui Transaction Extractor (Smart)")
+st.title("⚡ Sui Transaction Extractor (Final)")
+
+# --- 🛠️ MEMORY FIX: Force clear stale data ---
+if 'v_map' in st.session_state and st.session_state['v_map'] is None:
+    del st.session_state['v_map']
 
 # Auto-Load
 if 'v_map' not in st.session_state:
     with st.spinner("Loading Phonebook..."):
         st.session_state['v_map'] = get_validator_map()
-    if len(st.session_state['v_map']) > 10:
-        st.success(f"✅ Connected! Phonebook ready ({len(st.session_state['v_map'])} entries).")
+    
+    if len(st.session_state['v_map']) > 0:
+        st.success(f"✅ Connected! Phonebook ready ({len(st.session_state['v_map'])} validators).")
     else:
-        st.warning("⚠️ Using Backup Phonebook (Download blocked). Common names like Nansen should still work.")
+        st.warning("⚠️ Connected, but Phonebook is empty. (Network might be busy).")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
@@ -138,22 +129,21 @@ if uploaded_file:
         results_notes = []
         total_rows = len(df)
         
+        # Ensure we have a valid map (even if empty)
+        v_map = st.session_state.get('v_map') or {}
+
         for index, row in df.iterrows():
             tx_hash = str(row[hash_col]).strip()
             
             status_text.text(f"Processing {index + 1}/{total_rows}...")
             progress_bar.progress((index + 1) / total_rows)
             
-            amount, note = parse_transaction(
-                tx_hash, 
-                st.session_state.get('v_map', {}), 
-                target_keyword
-            )
+            amount, note = parse_transaction(tx_hash, v_map, target_keyword)
             
             results_amt.append(amount)
             results_notes.append(note)
             
-            # MANDATORY SLOW DOWN to prevent blocks
+            # 2 second pause to prevent "Network Error"
             time.sleep(2) 
         
         df[f"Amount ({target_keyword})"] = results_amt
