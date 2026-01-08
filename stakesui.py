@@ -1,30 +1,6 @@
 import streamlit as st
-import os
-import sys
-import subprocess
-import time
-import shutil
-
-# --- 🛠️ SELF-REPAIR BLOCK (Fixes ModuleNotFoundError) ---
-# This forces the server to install libraries if requirements.txt failed
-def install_libs():
-    libs = ["selenium", "webdriver-manager", "beautifulsoup4", "pandas", "openpyxl"]
-    for lib in libs:
-        try:
-            __import__(lib.replace("-", "_")) # basic check
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
-
-try:
-    import selenium
-    from selenium import webdriver
-except ImportError:
-    st.warning("⚙️ First-time setup: Installing missing libraries... (This takes 30s)")
-    install_libs()
-    st.rerun() # Restart app after install
-
-# --- NORMAL IMPORTS ---
 import pandas as pd
+from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -32,7 +8,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
+import time
 import re
+import shutil
 
 # --- CONFIGURATION & SETUP ---
 def get_driver():
@@ -46,26 +24,31 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     
-    # QA FIX for Streamlit Cloud:
-    # We check if 'chromium' is installed at the system level via packages.txt
+    # 1. CHECK FOR STREAMLIT CLOUD CONFIGURATION
+    # This checks if packages.txt successfully installed Chromium
     chromium_path = shutil.which("chromium")
     chromedriver_path = shutil.which("chromedriver")
     
-    # If we are on Streamlit Cloud, use the system chromium
     if chromium_path and chromedriver_path:
+        # We are on Streamlit Cloud
         options.binary_location = chromium_path
         service = Service(chromedriver_path)
     else:
-        # If we are running locally (Windows/Mac), download driver automatically
+        # 2. LOCAL FALLBACK (Windows/Mac)
+        # If running on your laptop, this downloads the driver automatically
         try:
             service = Service(ChromeDriverManager().install())
         except Exception as e:
+            st.error(f"Local driver error: {e}")
             return None
 
     try:
         driver = webdriver.Chrome(service=service, options=options)
         return driver
     except Exception as e:
+        # This error usually appears if packages.txt is missing on Cloud
+        st.error("🚨 Browser Error: Could not find Chrome.")
+        st.warning("If you are on Streamlit Cloud, make sure you added the 'packages.txt' file to your repo.")
         return None
 
 def scrape_suiscan(driver, tx_hash, target_keyword):
@@ -111,6 +94,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword):
         
         # 4. Search logic using Regex
         safe_keyword = re.escape(target_keyword)
+        # Pattern: Number ... SUI ... to ... Keyword
         pattern_str = r"([\-\d\.]+)\s+SUI\s+to\s+" + safe_keyword
         pattern = re.compile(pattern_str, re.IGNORECASE)
         
@@ -206,6 +190,3 @@ if uploaded_file:
                     file_name=f'suiscan_{target_keyword}_results.csv',
                     mime='text/csv',
                 )
-            else:
-                st.error("⚠️ Error: Browser not found. Did you add 'packages.txt'?")
-                st.markdown("**How to fix:** Create a file named `packages.txt` in your repo and add `chromium` inside it.")
