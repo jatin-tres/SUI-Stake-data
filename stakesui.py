@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
+from datetime import datetime, timezone
 
 # --- CONFIGURATION ---
 HEADERS = {
@@ -18,9 +19,6 @@ RPC_NODES = [
 ]
 
 def make_rpc_call(method, params):
-    """
-    Standard RPC handler with Node Rotation.
-    """
     for node in RPC_NODES:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
@@ -34,9 +32,6 @@ def make_rpc_call(method, params):
     return None
 
 def get_validator_map():
-    """
-    Downloads Phonebook. Returns empty dict if blocked (Offline Mode).
-    """
     validator_map = {}
     try:
         result = make_rpc_call("suix_getLatestSuiSystemStateV2", [])
@@ -49,15 +44,26 @@ def get_validator_map():
 
 def parse_single_block(block_data, validator_map, target_keyword):
     """
-    Logic to extract amount from a single transaction block data.
+    Extracts Timestamp, Amount, and Notes.
     """
     if not block_data:
-        return None, "Network Error (Details missing)"
-        
+        return None, None, "Network Error (Details missing)"
+    
+    # --- 1. EXTRACT TIMESTAMP ---
+    timestamp_str = "Unknown"
+    if 'timestampMs' in block_data and block_data['timestampMs']:
+        try:
+            ts_ms = int(block_data['timestampMs'])
+            # Convert to readable UTC format
+            dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            timestamp_str = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+        except:
+            timestamp_str = "Error Parsing Time"
+
     target_clean = target_keyword.lower()
     found_items = []
     
-    # 1. Search EVENTS
+    # --- 2. EXTRACT AMOUNT (Events) ---
     events = block_data.get('events', [])
     for event in events:
         parsed = event.get('parsedJson', {})
@@ -67,16 +73,15 @@ def parse_single_block(block_data, validator_map, target_keyword):
             amount_sui = amount_mist / 1_000_000_000
             
             val_name = validator_map.get(val_addr, "Unknown")
-            # Detect Nansen manually if phonebook failed
             if "0xa36a" in val_addr:
                 val_name = "Nansen (Detected)"
 
             if target_clean in val_name.lower():
-                return -amount_sui, f"✅ Staked to {val_name}"
+                return timestamp_str, -amount_sui, f"✅ Staked to {val_name}"
             
             found_items.append((-amount_sui, f"❓ Staked to {val_name}"))
 
-    # 2. Search BALANCE CHANGES
+    # --- 3. EXTRACT AMOUNT (Balance Changes) ---
     for change in block_data.get('balanceChanges', []):
         owner_data = change.get('owner', {})
         if isinstance(owner_data, dict):
@@ -88,20 +93,16 @@ def parse_single_block(block_data, validator_map, target_keyword):
                 owner_name = validator_map.get(owner_addr, "Unknown")
                 
                 if target_clean in owner_name.lower():
-                    return amount_sui, f"✅ Transfer to {owner_name}"
+                    return timestamp_str, amount_sui, f"✅ Transfer to {owner_name}"
 
-    # 3. Blind Mode Fallback
+    # Fallback
     if found_items:
-        return found_items[0][0], f"⚠️ Blind Mode: {found_items[0][1]}"
+        return timestamp_str, found_items[0][0], f"⚠️ Blind Mode: {found_items[0][1]}"
 
-    return None, f"No event found for '{target_keyword}'"
+    return timestamp_str, None, f"No event found for '{target_keyword}'"
 
 def fetch_batch_transactions(hashes):
-    """
-    TURBO MODE: Fetches multiple transactions in ONE network call.
-    Uses 'sui_multiGetTransactionBlocks'.
-    """
-    # Prepare params: List of Hashes, then Options
+    # Fetch all details including Input/Effects/Events
     params = [
         hashes, 
         {
@@ -111,24 +112,20 @@ def fetch_batch_transactions(hashes):
             "showEffects": True
         }
     ]
-    
-    # This returns a LIST of transaction blocks corresponding to the hashes
     results = make_rpc_call("sui_multiGetTransactionBlocks", params)
     return results
 
 # --- UI ---
 st.set_page_config(page_title="Sui API Extractor", page_icon="⚡")
-st.title("⚡ Sui Extractor (Turbo Batch Mode)")
+st.title("⚡ Sui Stake Extractor")
 
-# Auto-Load Phonebook
 if 'v_map' not in st.session_state:
     st.session_state['v_map'] = get_validator_map()
 
-# Status Indicator
 if st.session_state['v_map']:
     st.success(f"✅ Online Mode: Phonebook loaded ({len(st.session_state['v_map'])} validators).")
 else:
-    st.warning("⚠️ Offline Mode: Phonebook blocked. Using 'Hardcoded Detection' for Nansen.")
+    st.warning("⚠️ Offline Mode: Using 'Hardcoded Detection' for Nansen.")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
@@ -149,13 +146,13 @@ if uploaded_file:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Prepare Result Lists
-        # We pre-fill them with None so we can assign by index
+        # Lists for new columns
+        results_time = [None] * len(df)
         results_amt = [None] * len(df)
         results_notes = [None] * len(df)
         
-        # BATCH SETTINGS
-        BATCH_SIZE = 10 # Process 10 rows at a time
+        # BATCH PROCESSING
+        BATCH_SIZE = 10
         all_hashes = df[hash_col].astype(str).str.strip().tolist()
         v_map = st.session_state.get('v_map') or {}
 
@@ -165,42 +162,43 @@ if uploaded_file:
             batch_hashes = all_hashes[i : i + BATCH_SIZE]
             current_batch_idx = i // BATCH_SIZE
             
-            status_text.text(f"Processing Batch {current_batch_idx + 1}/{total_batches} ({len(batch_hashes)} txs)...")
+            status_text.text(f"Processing Batch {current_batch_idx + 1}/{total_batches}...")
             progress_bar.progress((i + 1) / len(all_hashes))
             
-            # 1. FETCH BATCH
             batch_data = fetch_batch_transactions(batch_hashes)
             
-            # 2. PROCESS BATCH
             if batch_data:
-                # Map results back to order. 
-                # Note: sui_multiGetTransactionBlocks result order usually matches request order, 
-                # but we should handle mismatches if possible. 
-                # For simplicity here, we assume 1:1 mapping or handle lookup.
-                
-                # Create a lookup dict for this batch {digest: data}
+                # Create lookup {digest: data}
                 batch_lookup = {item['digest']: item for item in batch_data if item and 'digest' in item}
                 
                 for j, tx_hash in enumerate(batch_hashes):
                     global_index = i + j
                     
                     if tx_hash in batch_lookup:
-                        amt, note = parse_single_block(batch_lookup[tx_hash], v_map, target_keyword)
+                        ts, amt, note = parse_single_block(batch_lookup[tx_hash], v_map, target_keyword)
+                        results_time[global_index] = ts
                         results_amt[global_index] = amt
                         results_notes[global_index] = note
                     else:
+                        results_time[global_index] = "Error"
                         results_amt[global_index] = None
-                        results_notes[global_index] = "Network Error (Batch failed for this Item)"
+                        results_notes[global_index] = "Batch Item Missing"
             else:
-                # If whole batch failed
                 for j in range(len(batch_hashes)):
-                    results_notes[i+j] = "Network Error (Whole Batch Failed)"
+                    results_notes[i+j] = "Batch Network Error"
             
-            # Small sleep between batches is better than sleep between every row
             time.sleep(1) 
         
+        # Assign columns
+        df["Timestamp"] = results_time
         df[f"Amount ({target_keyword})"] = results_amt
         df["Notes"] = results_notes
+        
+        # Reorder columns to put Timestamp first (optional preference)
+        cols = df.columns.tolist()
+        # Move Timestamp to be after the Hash column
+        cols.insert(cols.index(hash_col) + 1, cols.pop(cols.index("Timestamp")))
+        df = df[cols]
         
         st.success("✅ Done!")
         st.dataframe(df)
