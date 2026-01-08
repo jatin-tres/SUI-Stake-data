@@ -4,8 +4,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
@@ -21,8 +21,8 @@ def get_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    options.add_argument("--window-size=1920,1080") # Full HD to ensure visibility
+    options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     chromium_path = shutil.which("chromium")
     chromedriver_path = shutil.which("chromedriver")
@@ -37,6 +37,54 @@ def get_driver():
             return None
 
     return webdriver.Chrome(service=service, options=options)
+
+def aggressive_expand(driver):
+    """
+    Loops until the 'Show more' button is gone or we have tried 5 times.
+    """
+    attempts = 0
+    max_attempts = 5
+    
+    while attempts < max_attempts:
+        try:
+            # 1. Look for the button
+            xpath = "//*[contains(text(), 'Show more')]"
+            buttons = driver.find_elements(By.XPATH, xpath)
+            
+            # Filter for visible buttons only
+            visible_btn = None
+            for btn in buttons:
+                if btn.is_displayed():
+                    visible_btn = btn
+                    break
+            
+            # If no visible button found, WE ARE DONE! (List is expanded)
+            if not visible_btn:
+                return True
+            
+            # 2. If found, CLICK IT.
+            # Scroll it into center view
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", visible_btn)
+            time.sleep(1)
+            
+            # Method A: ActionChains (Mouse Simulation)
+            try:
+                actions = ActionChains(driver)
+                actions.move_to_element(visible_btn).click().perform()
+            except:
+                pass
+            
+            # Method B: Direct JS Trigger (Backup)
+            driver.execute_script("arguments[0].click();", visible_btn)
+            
+            time.sleep(2) # Wait for page to react
+            attempts += 1
+            
+        except Exception:
+            # If we crash looking for it, likely it's gone (Success)
+            return True
+            
+    return False
 
 def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     url = f"https://suiscan.xyz/mainnet/tx/{tx_hash}"
@@ -55,64 +103,36 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     screenshot = None
 
     try:
-        # 1. Wait for page load
+        # 1. Wait for body
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(5) 
+        time.sleep(4) 
         
-        # --- 🛠️ FIX: KEYBOARD & ZOOM STRATEGY ---
-        try:
-            # A. ZOOM OUT to prevent overlap
-            driver.execute_script("document.body.style.zoom='50%'")
-            time.sleep(1)
+        # --- 🛠️ FIX: CLOSED LOOP EXPANSION ---
+        # We call the aggressive expander. It blocks until expanded.
+        aggressive_expand(driver)
+        # -------------------------------------
 
-            # B. Find the button using XPath
-            # We look for the text "Show more"
-            xpath = "//*[contains(text(), 'Show more')]"
-            buttons = driver.find_elements(By.XPATH, xpath)
-            
-            for btn in buttons:
-                if btn.is_displayed():
-                    # Scroll to it
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                    time.sleep(1)
-                    
-                    # C. KEYBOARD ATTACK
-                    # Focus the element, then hit ENTER
-                    driver.execute_script("arguments[0].focus();", btn)
-                    ActionChains(driver).send_keys(Keys.ENTER).perform()
-                    time.sleep(1)
-                    # Double tap just in case
-                    ActionChains(driver).send_keys(Keys.SPACE).perform()
-                    
-                    time.sleep(4) # Wait for expansion
-                    break
-        except Exception as e:
-            result["Notes"] += f" (Input Error: {str(e)})"
-        # ----------------------------------------
-
-        # 3. Capture Screenshot
+        # 3. Capture Screenshot (Now we are sure it's expanded)
         if debug_mode:
             screenshot = driver.get_screenshot_as_png()
 
-        # 4. Parse Content (Get ALL text, including hidden ones)
+        # 4. Parse Content
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        # separator="\n" helps distinguish lines better
-        page_text = soup.get_text(separator="\n") 
+        page_text = soup.get_text(separator="  ") 
         
-        # 5. Search Logic (Smart Proximity)
+        # 5. Search Logic
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
         
         if not keyword_matches:
-            result["Notes"] = f"Keyword '{target_keyword}' not found (List might still be collapsed)."
+            result["Notes"] = f"Keyword '{target_keyword}' not found (List might be empty or name mismatch)."
         else:
             found_amount = False
             for match_index in keyword_matches:
-                # Look 200 chars BEHIND the keyword (increased range)
-                start_slice = max(0, match_index - 200)
+                # Look 150 chars BEHIND the keyword
+                start_slice = max(0, match_index - 150)
                 text_chunk = page_text[start_slice:match_index]
                 
                 # Regex: Number -> Optional Space -> SUI
-                # We relaxed it to allow spaces/newlines
                 amount_pattern = re.compile(r"([\-\d\.,]+)\s*SUI", re.IGNORECASE)
                 matches_in_chunk = list(amount_pattern.finditer(text_chunk))
                 
@@ -135,7 +155,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
-st.title("🔍 SuiScan Extractor (Keyboard Mode)")
+st.title("🔍 SuiScan Extractor (Aggressive Mode)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
