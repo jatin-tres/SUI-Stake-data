@@ -4,6 +4,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
@@ -40,6 +41,41 @@ def get_driver():
     except Exception:
         return None
 
+def force_click_element(driver, element):
+    """
+    Tries 4 different ways to click a stubborn element.
+    """
+    # Method 1: Standard Click
+    try:
+        element.click()
+        return True
+    except Exception:
+        pass
+
+    # Method 2: JavaScript Click (Bypasses UI overlays)
+    try:
+        driver.execute_script("arguments[0].click();", element)
+        return True
+    except Exception:
+        pass
+
+    # Method 3: ActionChains (Simulates real mouse movement)
+    try:
+        actions = ActionChains(driver)
+        actions.move_to_element(element).click().perform()
+        return True
+    except Exception:
+        pass
+        
+    # Method 4: Parent JavaScript Click (If the text itself is unclickable)
+    try:
+        driver.execute_script("arguments[0].parentElement.click();", element)
+        return True
+    except Exception:
+        pass
+
+    return False
+
 def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     url = f"https://suiscan.xyz/mainnet/tx/{tx_hash}"
     try:
@@ -59,46 +95,30 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     try:
         # 1. Wait for page load
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(4) # Allow full render
+        time.sleep(4) 
         
-        # --- 🛠️ FIX: NUCLEAR CLICKER LOGIC ---
-        click_success = False
-        try:
-            # Strategy 1: Find any element with "Show more" text
-            xpath = "//*[contains(text(), 'Show more')]"
-            elements = driver.find_elements(By.XPATH, xpath)
-            
-            for el in elements:
-                if el.is_displayed():
-                    # Scroll to center to avoid header overlap
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-                    time.sleep(0.5)
-                    
-                    # ATTEMPT 1: Click the text element itself
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(1)
-                    
-                    # ATTEMPT 2: Click the PARENT element (often the true button)
-                    driver.execute_script("arguments[0].parentElement.click();", el)
-                    time.sleep(2)
-                    click_success = True
-                    break
-            
-            # Strategy 2: If XPath failed, try CSS Selector for the specific class often used
-            if not click_success:
-                driver.execute_script("""
-                    const buttons = document.querySelectorAll('div, span, a');
-                    for (const btn of buttons) {
-                        if (btn.textContent.includes('Show more')) {
-                            btn.click();
-                            break;
-                        }
-                    }
-                """)
-                time.sleep(2)
+        # --- 🛠️ FIX: BRUTE FORCE EXPANDER ---
+        clicked_successfully = False
+        
+        # Locate candidates for "Show more"
+        # We look for ANY element containing that text
+        candidates = driver.find_elements(By.XPATH, "//*[contains(text(), 'Show more')]")
+        
+        for btn in candidates:
+            if btn.is_displayed():
+                # Scroll to center
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                time.sleep(1)
                 
-        except Exception as e:
-            result["Notes"] += f" (Click error: {str(e)})"
+                # Try all 4 click methods on this button
+                if force_click_element(driver, btn):
+                    time.sleep(2) # Wait for expansion
+                    clicked_successfully = True
+                    # Verify? (Optional: check if "Show less" appeared)
+                    break
+        
+        if not clicked_successfully:
+             result["Notes"] += " (Warning: Could not click 'Show more')"
         # ----------------------------------------
 
         # 3. Capture Screenshot (Post-Click)
@@ -110,11 +130,11 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
         page_text = soup.get_text(separator="  ") 
         
         # 5. Search Logic (Smart Proximity)
-        # Find all mentions of keyword (Case Insensitive)
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
         
         if not keyword_matches:
-            result["Notes"] = f"Keyword '{target_keyword}' not found (List did not expand)."
+            # Fallback: Maybe it's "Show More" (Capital M) or different text?
+            result["Notes"] = f"Keyword '{target_keyword}' not found (List likely collapsed)."
         else:
             found_amount = False
             for match_index in keyword_matches:
@@ -122,13 +142,11 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
                 start_slice = max(0, match_index - 100)
                 text_chunk = page_text[start_slice:match_index]
                 
-                # Regex logic specific to your screenshot: "-141.57 SUI"
-                # Matches: Number -> Optional Space -> SUI
+                # Regex logic: Number -> Optional Space -> SUI
                 amount_pattern = re.compile(r"([\-\d\.,]+)\s*SUI", re.IGNORECASE)
                 matches_in_chunk = list(amount_pattern.finditer(text_chunk))
                 
                 if matches_in_chunk:
-                    # The last match in the chunk is the one immediately before the name
                     best_match = matches_in_chunk[-1] 
                     result[col_name] = best_match.group(1)
                     result["Notes"] = "Success"
@@ -149,7 +167,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
 
 st.title("🔍 SuiScan Transaction Extractor")
-st.markdown("Extracts validator stake amounts. **Updated with Parent-Click Logic.**")
+st.markdown("Extracts validator stake amounts. **Updated with Brute Force Clicker.**")
 
 # 1. Upload
 st.subheader("Step 1: Upload Data")
