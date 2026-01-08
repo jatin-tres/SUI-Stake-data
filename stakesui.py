@@ -12,7 +12,7 @@ import time
 import re
 import shutil
 
-# --- BROWSER SETUP ---
+# --- BROWSER SETUP (ANTI-DETECTION) ---
 def get_driver():
     options = Options()
     options.add_argument("--headless")
@@ -20,7 +20,12 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # CRITICAL: Hide "Automation" flag to prevent button locking
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
     
     chromium_path = shutil.which("chromium")
     chromedriver_path = shutil.which("chromedriver")
@@ -36,43 +41,50 @@ def get_driver():
 
     return webdriver.Chrome(service=service, options=options)
 
-def clean_page_layout(driver):
+def coordinate_click(driver):
     """
-    Deletes headers/footers/widgets to prevent click interception.
-    """
-    driver.execute_script("""
-        document.querySelectorAll('header, footer, #onetrust-banner-sdk, .intercom-lightweight-app, [class*="sticky"], [class*="fixed"]').forEach(el => el.remove());
-    """)
-    time.sleep(0.5)
-
-def recursive_click(driver):
-    """
-    Finds 'Show more' and clicks:
-    1. The element itself
-    2. The Parent
-    3. The Grandparent
-    This solves React 'wrapper click' issues.
+    Finds the text 'Show more', calculates its X/Y pixels, 
+    and fires a click event at that exact screen location.
     """
     try:
-        # Find all elements containing the text "Show more"
+        # Find element by text
         xpath = "//*[contains(text(), 'Show more')]"
         elements = driver.find_elements(By.XPATH, xpath)
         
         for el in elements:
             if el.is_displayed():
-                # Highlight for debug screenshot
-                driver.execute_script("arguments[0].style.border='3px solid red'", el)
-                
-                # Scroll to it
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", el)
+                # 1. Scroll to Center
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", el)
                 time.sleep(1)
                 
-                # CLICK BLITZ: Click element, then parent, then grandparent
-                driver.execute_script("arguments[0].click();", el) # Click text
-                driver.execute_script("arguments[0].parentElement.click();", el) # Click wrapper
-                driver.execute_script("arguments[0].parentElement.parentElement.click();", el) # Click container
+                # 2. COORDINATE CLICK (The Fix)
+                # We calculate the center pixel of the element and click IT, not the tag.
+                driver.execute_script("""
+                    const el = arguments[0];
+                    const rect = el.getBoundingClientRect();
+                    const x = rect.left + (rect.width / 2);
+                    const y = rect.top + (rect.height / 2);
+                    
+                    // Create a physical click at these coordinates
+                    const clickEvent = new MouseEvent('click', {
+                        view: window,
+                        bubbles: true,
+                        cancelable: true,
+                        clientX: x,
+                        clientY: y
+                    });
+                    
+                    // Find whatever is at that pixel (Button, Div, Overlay) and click it
+                    const topElement = document.elementFromPoint(x, y);
+                    if (topElement) {
+                        topElement.dispatchEvent(clickEvent);
+                        topElement.click(); 
+                    } else {
+                        el.click(); // Fallback
+                    }
+                """, el)
                 
-                time.sleep(2)
+                time.sleep(3) # Wait for expansion
                 return True
     except Exception:
         pass
@@ -97,15 +109,23 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     try:
         # 1. Wait for body
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(4) 
+        time.sleep(5) 
         
-        # 2. Clean Layout
-        clean_page_layout(driver)
-        
-        # 3. RECURSIVE CLICK
-        recursive_click(driver)
-        
-        # 4. Capture Screenshot (Check for red border to confirm finding)
+        # 2. Try Coordinate Click
+        coordinate_click(driver)
+
+        # 3. Check if we need to click MORE (Pagination loop)
+        # Sometimes you have to click 'Show more' multiple times
+        for _ in range(3):
+            # Check if keyword is found yet
+            if target_keyword.lower() in driver.page_source.lower():
+                break # Found it, stop clicking
+            # If not found, try clicking again
+            clicked = coordinate_click(driver)
+            if not clicked:
+                break # No more buttons found
+
+        # 4. Capture Screenshot
         if debug_mode:
             screenshot = driver.get_screenshot_as_png()
 
@@ -148,7 +168,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
-st.title("🔍 SuiScan Extractor (Recursive Click)")
+st.title("🔍 SuiScan Extractor (Coordinate Click)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
