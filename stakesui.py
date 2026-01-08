@@ -36,26 +36,49 @@ def get_driver():
 
     return webdriver.Chrome(service=service, options=options)
 
-def clean_page_layout(driver):
+def smart_click(driver, xpath_list):
     """
-    NUCLEAR OPTION: Deletes headers, footers, and cookie banners 
-    so nothing can intercept our click.
+    Finds an element. Checks if it's covered by a banner/header.
+    Deletes the covering element. Clicks.
     """
-    try:
-        driver.execute_script("""
-            // Remove sticky headers, footers, and cookie modals
-            const selectors = [
-                'header', 'footer', '#onetrust-banner-sdk', 
-                '.cookie-consent', '[class*="banner"]', '[class*="header"]', 
-                '[class*="overlay"]', '[class*="popup"]'
-            ];
-            selectors.forEach(s => {
-                document.querySelectorAll(s).forEach(el => el.remove());
-            });
-        """)
-        time.sleep(0.5)
-    except:
-        pass
+    for xpath in xpath_list:
+        try:
+            elements = driver.find_elements(By.XPATH, xpath)
+            for btn in elements:
+                if btn.is_displayed():
+                    # 1. Scroll to center
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", btn)
+                    time.sleep(1)
+                    
+                    # 2. OBSTACLE REMOVAL LOOP
+                    # We check 3 times if something is covering our button
+                    for _ in range(3):
+                        is_covered = driver.execute_script("""
+                            var el = arguments[0];
+                            var rect = el.getBoundingClientRect();
+                            var x = rect.left + rect.width/2;
+                            var y = rect.top + rect.height/2;
+                            var topEl = document.elementFromPoint(x, y);
+                            
+                            // If the top element is NOT our button (or a descendant), delete it
+                            if (topEl && !el.contains(topEl) && !topEl.contains(el)) {
+                                topEl.remove(); // DELETE THE OBSTACLE
+                                return true;
+                            }
+                            return false;
+                        """, btn)
+                        
+                        if is_covered:
+                            time.sleep(0.5) # Wait for deletion to render
+                        else:
+                            break
+                    
+                    # 3. Force Click (JavaScipt)
+                    driver.execute_script("arguments[0].click();", btn)
+                    return True
+        except Exception:
+            continue
+    return False
 
 def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     url = f"https://suiscan.xyz/mainnet/tx/{tx_hash}"
@@ -74,32 +97,27 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     screenshot = None
 
     try:
-        # 1. Wait for page load
+        # 1. Wait for body
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(5) 
         
-        # 2. CLEAN OBSTACLES (The Fix)
-        clean_page_layout(driver)
+        # 2. Zoom out to see more (prevents scroll issues)
+        driver.execute_script("document.body.style.zoom='50%'")
+        time.sleep(1)
 
-        # 3. ROBUST CLICKER
-        try:
-            # Find element containing 'Show more'
-            # Using specific XPath to find the text node's parent
-            xpath = "//*[contains(text(), 'Show more')]"
-            buttons = driver.find_elements(By.XPATH, xpath)
-            
-            for btn in buttons:
-                if btn.is_displayed():
-                    # Scroll directly to it
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", btn)
-                    time.sleep(1)
-                    
-                    # Force Click
-                    driver.execute_script("arguments[0].click();", btn)
-                    time.sleep(3) # Wait for expansion
-                    break
-        except Exception as e:
-            result["Notes"] += f" (Click failed: {str(e)})"
+        # 3. SMART CLICK LOGIC
+        # We look for "Show more" text OR the specific class for the expander
+        candidates = [
+            "//*[contains(text(), 'Show more')]",
+            "//div[contains(@class, 'cursor-pointer') and contains(., 'Show more')]"
+        ]
+        
+        clicked = smart_click(driver, candidates)
+        
+        if clicked:
+            time.sleep(3) # Wait for expansion
+        else:
+            result["Notes"] += " (Warning: Show more button not found/clickable)"
 
         # 4. Capture Screenshot
         if debug_mode:
@@ -109,11 +127,11 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
         soup = BeautifulSoup(driver.page_source, "html.parser")
         page_text = soup.get_text(separator="  ") 
         
-        # 6. Search Logic (Smart Proximity)
+        # 6. Search Logic
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
         
         if not keyword_matches:
-            result["Notes"] = f"Keyword '{target_keyword}' not found (List might be collapsed)."
+            result["Notes"] = f"Keyword '{target_keyword}' not found (List collapsed?)"
         else:
             found_amount = False
             for match_index in keyword_matches:
@@ -144,7 +162,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
-st.title("🔍 SuiScan Extractor (Banner Killer)")
+st.title("🔍 SuiScan Extractor (Obstacle Destroyer)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
