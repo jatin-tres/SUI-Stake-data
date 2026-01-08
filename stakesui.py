@@ -4,8 +4,6 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
@@ -21,8 +19,8 @@ def get_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080") # Full HD to ensure visibility
-    options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     chromium_path = shutil.which("chromium")
     chromedriver_path = shutil.which("chromedriver")
@@ -38,53 +36,26 @@ def get_driver():
 
     return webdriver.Chrome(service=service, options=options)
 
-def aggressive_expand(driver):
+def clean_page_layout(driver):
     """
-    Loops until the 'Show more' button is gone or we have tried 5 times.
+    NUCLEAR OPTION: Deletes headers, footers, and cookie banners 
+    so nothing can intercept our click.
     """
-    attempts = 0
-    max_attempts = 5
-    
-    while attempts < max_attempts:
-        try:
-            # 1. Look for the button
-            xpath = "//*[contains(text(), 'Show more')]"
-            buttons = driver.find_elements(By.XPATH, xpath)
-            
-            # Filter for visible buttons only
-            visible_btn = None
-            for btn in buttons:
-                if btn.is_displayed():
-                    visible_btn = btn
-                    break
-            
-            # If no visible button found, WE ARE DONE! (List is expanded)
-            if not visible_btn:
-                return True
-            
-            # 2. If found, CLICK IT.
-            # Scroll it into center view
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", visible_btn)
-            time.sleep(1)
-            
-            # Method A: ActionChains (Mouse Simulation)
-            try:
-                actions = ActionChains(driver)
-                actions.move_to_element(visible_btn).click().perform()
-            except:
-                pass
-            
-            # Method B: Direct JS Trigger (Backup)
-            driver.execute_script("arguments[0].click();", visible_btn)
-            
-            time.sleep(2) # Wait for page to react
-            attempts += 1
-            
-        except Exception:
-            # If we crash looking for it, likely it's gone (Success)
-            return True
-            
-    return False
+    try:
+        driver.execute_script("""
+            // Remove sticky headers, footers, and cookie modals
+            const selectors = [
+                'header', 'footer', '#onetrust-banner-sdk', 
+                '.cookie-consent', '[class*="banner"]', '[class*="header"]', 
+                '[class*="overlay"]', '[class*="popup"]'
+            ];
+            selectors.forEach(s => {
+                document.querySelectorAll(s).forEach(el => el.remove());
+            });
+        """)
+        time.sleep(0.5)
+    except:
+        pass
 
 def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     url = f"https://suiscan.xyz/mainnet/tx/{tx_hash}"
@@ -103,28 +74,46 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     screenshot = None
 
     try:
-        # 1. Wait for body
+        # 1. Wait for page load
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(4) 
+        time.sleep(5) 
         
-        # --- 🛠️ FIX: CLOSED LOOP EXPANSION ---
-        # We call the aggressive expander. It blocks until expanded.
-        aggressive_expand(driver)
-        # -------------------------------------
+        # 2. CLEAN OBSTACLES (The Fix)
+        clean_page_layout(driver)
 
-        # 3. Capture Screenshot (Now we are sure it's expanded)
+        # 3. ROBUST CLICKER
+        try:
+            # Find element containing 'Show more'
+            # Using specific XPath to find the text node's parent
+            xpath = "//*[contains(text(), 'Show more')]"
+            buttons = driver.find_elements(By.XPATH, xpath)
+            
+            for btn in buttons:
+                if btn.is_displayed():
+                    # Scroll directly to it
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", btn)
+                    time.sleep(1)
+                    
+                    # Force Click
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(3) # Wait for expansion
+                    break
+        except Exception as e:
+            result["Notes"] += f" (Click failed: {str(e)})"
+
+        # 4. Capture Screenshot
         if debug_mode:
             screenshot = driver.get_screenshot_as_png()
 
-        # 4. Parse Content
+        # 5. Parse Content
         soup = BeautifulSoup(driver.page_source, "html.parser")
         page_text = soup.get_text(separator="  ") 
         
-        # 5. Search Logic
+        # 6. Search Logic (Smart Proximity)
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
         
         if not keyword_matches:
-            result["Notes"] = f"Keyword '{target_keyword}' not found (List might be empty or name mismatch)."
+            result["Notes"] = f"Keyword '{target_keyword}' not found (List might be collapsed)."
         else:
             found_amount = False
             for match_index in keyword_matches:
@@ -155,7 +144,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
-st.title("🔍 SuiScan Extractor (Aggressive Mode)")
+st.title("🔍 SuiScan Extractor (Banner Killer)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
