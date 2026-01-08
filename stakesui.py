@@ -14,17 +14,15 @@ import shutil
 
 # --- CONFIGURATION & SETUP ---
 def get_driver():
-    """
-    Starts a Chrome browser. 
-    Auto-detects if running on Streamlit Cloud (Linux) or Local Machine.
-    """
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    # Make the bot look like a real Mac user
+    options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    # Check for Streamlit Cloud Configuration
     chromium_path = shutil.which("chromium")
     chromedriver_path = shutil.which("chromedriver")
     
@@ -34,29 +32,21 @@ def get_driver():
     else:
         try:
             service = Service(ChromeDriverManager().install())
-        except Exception as e:
-            st.error(f"Local driver error: {e}")
+        except Exception:
             return None
 
     try:
         driver = webdriver.Chrome(service=service, options=options)
         return driver
-    except Exception as e:
+    except Exception:
         return None
 
-def scrape_suiscan(driver, tx_hash, target_keyword):
-    """
-    Robust scraping logic:
-    1. Visits page.
-    2. Clicks 'Show More'.
-    3. Finds Keyword.
-    4. Looks 'backwards' from the keyword to find the associated SUI amount.
-    """
+def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     url = f"https://suiscan.xyz/mainnet/tx/{tx_hash}"
     try:
         driver.get(url)
     except Exception:
-        return {"Transaction Hash": tx_hash, "Status": "Network Error", "Notes": "Could not reach URL"}
+        return {"Transaction Hash": tx_hash, "Status": "Network Error", "Notes": "Could not reach URL"}, None
     
     col_name = f"Amount to '{target_keyword}'"
     result = {
@@ -65,34 +55,55 @@ def scrape_suiscan(driver, tx_hash, target_keyword):
         "Status": "Processed",
         "Notes": ""
     }
+    screenshot = None
 
     try:
-        # 1. Wait for page
+        # 1. Wait for body
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         
-        # 2. Click "Show more" (Aggressive search for the button)
+        # 2. AGGRESSIVE "SHOW MORE" CLICKER
         try:
-            time.sleep(3) # Give extra time for the button to appear
-            buttons = driver.find_elements(By.TAG_NAME, "button")
-            for btn in buttons:
-                # Check for "Show" text (case insensitive) or specific classes if needed
-                if "show" in btn.text.lower() and "more" in btn.text.lower():
-                    if btn.is_displayed():
-                        driver.execute_script("arguments[0].click();", btn)
-                        time.sleep(1)
+            time.sleep(3) # Wait for load
+            
+            # Find ANY element (div, span, button, a) containing text "Show more" (case insensitive)
+            # XPath translation handles case insensitivity
+            xpath = "//*[contains(translate(text(), 'SHOW', 'show'), 'show more')]"
+            show_more_elements = driver.find_elements(By.XPATH, xpath)
+            
+            clicked = False
+            if show_more_elements:
+                for el in show_more_elements:
+                    if el.is_displayed():
+                        # Scroll to element to ensure it's clickable
+                        driver.execute_script("arguments[0].scrollIntoView(true);", el)
+                        time.sleep(0.5)
+                        # Force click with JavaScript (bypasses overlapping elements)
+                        driver.execute_script("arguments[0].click();", el)
+                        time.sleep(2) # Wait for expansion
+                        clicked = True
                         break
-        except Exception:
-            pass # Continue even if button fails, data might be visible
+            
+            if not clicked:
+                # If xpath failed, try a very generic check for the specific class often used in tables
+                buttons = driver.find_elements(By.TAG_NAME, "div")
+                for btn in buttons:
+                    if "Show more" in btn.text:
+                        driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(2)
+                        break
 
-        # 3. Parse Content
+        except Exception as e:
+            result["Notes"] = f"Warning: Interaction issue ({str(e)})"
+
+        # 3. Capture Debug Screenshot if requested
+        if debug_mode:
+            screenshot = driver.get_screenshot_as_png()
+
+        # 4. Parse Content
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        # specific separator helps distinguish separate elements
         page_text = soup.get_text(separator="  ") 
         
-        # 4. Smart Proximity Search
-        # Instead of a fixed regex, we find the keyword and look at the text immediately BEFORE it.
-        
-        # Find all start indices of the keyword
+        # 5. Search Logic (Smart Proximity)
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
         
         if not keyword_matches:
@@ -100,51 +111,40 @@ def scrape_suiscan(driver, tx_hash, target_keyword):
         else:
             found_amount = False
             for match_index in keyword_matches:
-                # Grab the 100 characters leading up to the keyword
-                start_slice = max(0, match_index - 100)
+                # Look at the 150 chars BEFORE the keyword
+                start_slice = max(0, match_index - 150)
                 text_chunk = page_text[start_slice:match_index]
                 
-                # Look for a number pattern near "SUI" inside this chunk
-                # Pattern: Number -> (optional space) -> SUI -> (optional junk) -> Keyword (implied at end)
-                # Regex logic: 
-                # ([\-\d\.,]+)  : Capture number (supports commas and negatives)
-                # \s* : Optional space
-                # SUI           : The unit
+                # Regex: Number ... SUI
                 amount_pattern = re.compile(r"([\-\d\.,]+)\s*SUI", re.IGNORECASE)
-                
-                # Search from the end of the chunk (closest to the keyword)
                 matches_in_chunk = list(amount_pattern.finditer(text_chunk))
                 
                 if matches_in_chunk:
-                    # Take the last match in the chunk, as it is closest to our keyword
-                    best_match = matches_in_chunk[-1]
-                    extracted_number = best_match.group(1)
-                    
-                    result[col_name] = extracted_number
+                    best_match = matches_in_chunk[-1] # Closest one
+                    result[col_name] = best_match.group(1)
                     result["Notes"] = "Success"
                     found_amount = True
-                    break # Stop after finding the first valid match
+                    break 
             
             if not found_amount:
-                # Debug info: Show user what text was actually near the keyword
                 snippet = page_text[max(0, keyword_matches[0]-50) : keyword_matches[0]]
-                result["Notes"] = f"Found '{target_keyword}' but couldn't find amount. Text near it: '...{snippet}...'"
+                result["Notes"] = f"Found '{target_keyword}' but couldn't link amount. Context: '...{snippet}...'"
 
     except Exception as e:
         result["Status"] = "Error"
         result["Notes"] = str(e)
         
-    return result
+    return result, screenshot
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
 
 st.title("🔍 SuiScan Transaction Extractor")
-st.markdown("Updated with **Smart Proximity Search** to find numbers even with hidden icons or formatting.")
+st.markdown("Extracts validator stake amounts even if hidden under 'Show more'.")
 
-# 1. File Uploader
+# 1. Upload
 st.subheader("Step 1: Upload Data")
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
 if uploaded_file:
     try:
@@ -162,30 +162,30 @@ if uploaded_file:
     
     with col1:
         cols = df.columns.tolist()
-        hash_col = st.selectbox("Column with Transaction Hash", cols, index=0)
+        hash_col = st.selectbox("Transaction Hash Column", cols, index=0)
         
     with col2:
-        target_keyword = st.text_input(
-            "Search Keyword", 
-            value="Nansen", 
-            placeholder="e.g. Nansen, Coinbase"
-        )
+        target_keyword = st.text_input("Search Keyword", value="Nansen")
+    
+    debug_mode = st.checkbox("📸 Enable Debug Screenshots (See what the bot sees)", value=False)
 
     st.write("---")
     
+    # 3. Run
     if st.button("🚀 Start Extraction"):
         if not target_keyword:
             st.error("Please enter a keyword.")
         else:
             status_container = st.empty()
-            status_container.info("Initializing Browser Engine...")
+            status_container.info("Starting Browser...")
             
             driver = get_driver()
             
             if driver:
-                status_container.success("Browser Engine Started!")
+                status_container.success("Browser Active!")
                 progress_bar = st.progress(0)
                 status_text = st.empty()
+                debug_area = st.expander("Debug Screenshots", expanded=True)
                 
                 results = []
                 total_rows = len(df)
@@ -196,26 +196,31 @@ if uploaded_file:
                     status_text.text(f"Scanning {index + 1}/{total_rows}: {tx_hash}")
                     progress_bar.progress((index + 1) / total_rows)
                     
-                    data = scrape_suiscan(driver, tx_hash, target_keyword)
+                    data, screenshot = scrape_suiscan(driver, tx_hash, target_keyword, debug_mode)
                     results.append(data)
                     
-                    time.sleep(1) 
+                    # Show screenshot if debug is on and we failed to find data
+                    if debug_mode and screenshot and data[f"Amount to '{target_keyword}'"] == "Not Found":
+                        with debug_area:
+                            st.write(f"❌ Failed on: {tx_hash}")
+                            st.image(screenshot, caption=f"View of {tx_hash}", width=700)
+                    
+                    time.sleep(1)
 
                 driver.quit()
                 
-                # Show results
                 results_df = pd.DataFrame(results)
                 final_df = pd.concat([df, results_df.drop(columns=["Transaction Hash"], errors='ignore')], axis=1)
                 
-                st.success("✅ Extraction Complete!")
+                st.success("✅ Done!")
                 st.dataframe(final_df)
                 
                 csv = final_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label=f"📥 Download Results ({target_keyword})",
+                    label=f"📥 Download Results",
                     data=csv,
-                    file_name=f'suiscan_{target_keyword}_results.csv',
+                    file_name=f'suiscan_results.csv',
                     mime='text/csv',
                 )
             else:
-                st.error("⚠️ Browser Error: Could not start Chrome. Check logs.")
+                st.error("⚠️ Browser Error: Could not start Chrome.")
