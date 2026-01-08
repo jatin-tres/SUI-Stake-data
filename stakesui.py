@@ -20,7 +20,6 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # Masking as a real user to avoid anti-bot blocks
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     chromium_path = shutil.which("chromium")
@@ -60,47 +59,49 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     try:
         # 1. Wait for page load
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(3) # Initial settle time
+        time.sleep(4) # Allow full render
         
-        # --- 🛠️ FIX: AGGRESSIVE JS CLICKER ---
+        # --- 🛠️ FIX: NUCLEAR CLICKER LOGIC ---
+        click_success = False
         try:
-            # We look for ANY element containing "Show more" text
-            # This XPath finds div, span, p, or button with that text
+            # Strategy 1: Find any element with "Show more" text
             xpath = "//*[contains(text(), 'Show more')]"
-            buttons = driver.find_elements(By.XPATH, xpath)
+            elements = driver.find_elements(By.XPATH, xpath)
             
-            if buttons:
-                for btn in buttons:
-                    if btn.is_displayed():
-                        # 1. Scroll it into the center of the view (fixes "obscured" errors)
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                        time.sleep(1) 
-                        
-                        # 2. Force click using JavaScript engine (bypasses UI overlay blocks)
-                        driver.execute_script("arguments[0].click();", btn)
-                        
-                        # 3. Wait specifically for the layout to expand
-                        time.sleep(3)
-                        break
-            else:
-                # Backup: Try clicking the "Show more" specifically by class if text fails
-                # (Sometimes text is hidden in a pseudo-element)
+            for el in elements:
+                if el.is_displayed():
+                    # Scroll to center to avoid header overlap
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                    time.sleep(0.5)
+                    
+                    # ATTEMPT 1: Click the text element itself
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(1)
+                    
+                    # ATTEMPT 2: Click the PARENT element (often the true button)
+                    driver.execute_script("arguments[0].parentElement.click();", el)
+                    time.sleep(2)
+                    click_success = True
+                    break
+            
+            # Strategy 2: If XPath failed, try CSS Selector for the specific class often used
+            if not click_success:
                 driver.execute_script("""
-                    let elements = document.querySelectorAll('div, span, button');
-                    for (let el of elements) {
-                        if (el.innerText.includes('Show more')) {
-                            el.click();
+                    const buttons = document.querySelectorAll('div, span, a');
+                    for (const btn of buttons) {
+                        if (btn.textContent.includes('Show more')) {
+                            btn.click();
                             break;
                         }
                     }
                 """)
-                time.sleep(3)
+                time.sleep(2)
                 
         except Exception as e:
-            result["Notes"] += f" (Click warning: {str(e)})"
+            result["Notes"] += f" (Click error: {str(e)})"
         # ----------------------------------------
 
-        # 3. Capture Screenshot (Now happens AFTER the click attempt)
+        # 3. Capture Screenshot (Post-Click)
         if debug_mode:
             screenshot = driver.get_screenshot_as_png()
 
@@ -109,24 +110,26 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
         page_text = soup.get_text(separator="  ") 
         
         # 5. Search Logic (Smart Proximity)
-        # Find all mentions of keyword
+        # Find all mentions of keyword (Case Insensitive)
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
         
         if not keyword_matches:
-            result["Notes"] = f"Keyword '{target_keyword}' not found (List might not have expanded)."
+            result["Notes"] = f"Keyword '{target_keyword}' not found (List did not expand)."
         else:
             found_amount = False
             for match_index in keyword_matches:
-                # Look 150 chars BEHIND the keyword
-                start_slice = max(0, match_index - 150)
+                # Look 100 chars BEHIND the keyword
+                start_slice = max(0, match_index - 100)
                 text_chunk = page_text[start_slice:match_index]
                 
-                # Regex to find: Number ... SUI
+                # Regex logic specific to your screenshot: "-141.57 SUI"
+                # Matches: Number -> Optional Space -> SUI
                 amount_pattern = re.compile(r"([\-\d\.,]+)\s*SUI", re.IGNORECASE)
                 matches_in_chunk = list(amount_pattern.finditer(text_chunk))
                 
                 if matches_in_chunk:
-                    best_match = matches_in_chunk[-1] # The one closest to the name
+                    # The last match in the chunk is the one immediately before the name
+                    best_match = matches_in_chunk[-1] 
                     result[col_name] = best_match.group(1)
                     result["Notes"] = "Success"
                     found_amount = True
@@ -134,7 +137,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
             
             if not found_amount:
                 snippet = page_text[max(0, keyword_matches[0]-50) : keyword_matches[0]]
-                result["Notes"] = f"Found '{target_keyword}' but no amount near it. Context: '...{snippet}...'"
+                result["Notes"] = f"Found '{target_keyword}' but couldn't link amount. Context: '...{snippet}...'"
 
     except Exception as e:
         result["Status"] = "Error"
@@ -146,7 +149,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
 
 st.title("🔍 SuiScan Transaction Extractor")
-st.markdown("Extracts validator stake amounts. **Updated with Force-Click technology.**")
+st.markdown("Extracts validator stake amounts. **Updated with Parent-Click Logic.**")
 
 # 1. Upload
 st.subheader("Step 1: Upload Data")
@@ -205,7 +208,6 @@ if uploaded_file:
                     data, screenshot = scrape_suiscan(driver, tx_hash, target_keyword, debug_mode)
                     results.append(data)
                     
-                    # Show screenshot if 'Not Found'
                     if debug_mode and screenshot and data[f"Amount to '{target_keyword}'"] == "Not Found":
                         with debug_area:
                             st.warning(f"❌ Failed on: {tx_hash}")
@@ -229,4 +231,4 @@ if uploaded_file:
                     mime='text/csv',
                 )
             else:
-                st.error("⚠️ Browser Error: Could not start Chrome.")
+                st.error("⚠️ Browser Error: Could not start Chrome. Check logs.")
