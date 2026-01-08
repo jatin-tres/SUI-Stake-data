@@ -4,6 +4,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
@@ -20,8 +22,7 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # Disguise as a real user
-    options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     chromium_path = shutil.which("chromium")
     chromedriver_path = shutil.which("chromedriver")
@@ -56,51 +57,47 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     try:
         # 1. Wait for page load
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(5) # Mandatory wait for React to hydrate
+        time.sleep(5) 
         
-        # --- 🛠️ FIX: SYNTHETIC EVENT INJECTION ---
-        # This script creates a fake mouse event sequence (down -> up -> click) 
-        # and fires it on the text, the parent, AND the grandparent container.
+        # --- 🛠️ FIX: KEYBOARD & ZOOM STRATEGY ---
         try:
-            driver.execute_script("""
-                function triggerEvents(el) {
-                    const events = ['mousedown', 'mouseup', 'click'];
-                    events.forEach(eventType => {
-                        const event = new MouseEvent(eventType, {
-                            bubbles: true,
-                            cancelable: true,
-                            view: window
-                        });
-                        el.dispatchEvent(event);
-                    });
-                }
+            # A. ZOOM OUT to prevent overlap
+            driver.execute_script("document.body.style.zoom='50%'")
+            time.sleep(1)
 
-                // Find all elements containing "Show more"
-                const xpath = "//*[contains(text(), 'Show more')]";
-                const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                
-                for (let i = 0; i < result.snapshotLength; i++) {
-                    let el = result.snapshotItem(i);
-                    // 1. Click the text itself
-                    triggerEvents(el);
-                    // 2. Click the parent (often the button wrapper)
-                    if (el.parentElement) triggerEvents(el.parentElement);
-                    // 3. Click the grandparent (just in case)
-                    if (el.parentElement && el.parentElement.parentElement) triggerEvents(el.parentElement.parentElement);
-                }
-            """)
-            time.sleep(4) # Wait for expansion
+            # B. Find the button using XPath
+            # We look for the text "Show more"
+            xpath = "//*[contains(text(), 'Show more')]"
+            buttons = driver.find_elements(By.XPATH, xpath)
+            
+            for btn in buttons:
+                if btn.is_displayed():
+                    # Scroll to it
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                    time.sleep(1)
+                    
+                    # C. KEYBOARD ATTACK
+                    # Focus the element, then hit ENTER
+                    driver.execute_script("arguments[0].focus();", btn)
+                    ActionChains(driver).send_keys(Keys.ENTER).perform()
+                    time.sleep(1)
+                    # Double tap just in case
+                    ActionChains(driver).send_keys(Keys.SPACE).perform()
+                    
+                    time.sleep(4) # Wait for expansion
+                    break
         except Exception as e:
-            result["Notes"] += f" (Click failed: {str(e)})"
+            result["Notes"] += f" (Input Error: {str(e)})"
         # ----------------------------------------
 
         # 3. Capture Screenshot
         if debug_mode:
             screenshot = driver.get_screenshot_as_png()
 
-        # 4. Parse Content
+        # 4. Parse Content (Get ALL text, including hidden ones)
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        page_text = soup.get_text(separator="  ") 
+        # separator="\n" helps distinguish lines better
+        page_text = soup.get_text(separator="\n") 
         
         # 5. Search Logic (Smart Proximity)
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
@@ -110,11 +107,12 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
         else:
             found_amount = False
             for match_index in keyword_matches:
-                # Look 150 chars BEHIND the keyword
-                start_slice = max(0, match_index - 150)
+                # Look 200 chars BEHIND the keyword (increased range)
+                start_slice = max(0, match_index - 200)
                 text_chunk = page_text[start_slice:match_index]
                 
                 # Regex: Number -> Optional Space -> SUI
+                # We relaxed it to allow spaces/newlines
                 amount_pattern = re.compile(r"([\-\d\.,]+)\s*SUI", re.IGNORECASE)
                 matches_in_chunk = list(amount_pattern.finditer(text_chunk))
                 
@@ -126,7 +124,6 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
                     break 
             
             if not found_amount:
-                # Debug snippet
                 snippet = page_text[max(0, keyword_matches[0]-50) : keyword_matches[0]]
                 result["Notes"] = f"Found '{target_keyword}' but amount not linked. Context: '...{snippet}...'"
 
@@ -138,7 +135,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
-st.title("🔍 SuiScan Transaction Extractor (Event Injector)")
+st.title("🔍 SuiScan Extractor (Keyboard Mode)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
