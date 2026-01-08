@@ -12,7 +12,7 @@ import time
 import re
 import shutil
 
-# --- CONFIGURATION ---
+# --- BROWSER SETUP ---
 def get_driver():
     options = Options()
     options.add_argument("--headless")
@@ -20,7 +20,8 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    # Disguise as a real user
+    options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     chromium_path = shutil.which("chromium")
     chromedriver_path = shutil.which("chromedriver")
@@ -54,28 +55,43 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
     try:
         # 1. Wait for page load
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(5) # Wait for full render
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(5) # Mandatory wait for React to hydrate
         
-        # --- 🛠️ FIX: FORCE EXPAND HIDDEN ITEMS DIRECTLY ---
-        # Instead of clicking "Show more", we simply find all hidden rows and make them visible via JS
+        # --- 🛠️ FIX: SYNTHETIC EVENT INJECTION ---
+        # This script creates a fake mouse event sequence (down -> up -> click) 
+        # and fires it on the text, the parent, AND the grandparent container.
         try:
             driver.execute_script("""
-                // 1. Force click the button using native event dispatch (stronger than .click())
-                let buttons = document.evaluate("//*[contains(text(), 'Show more')]", document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                for (let i = 0; i < buttons.snapshotLength; i++) {
-                    let btn = buttons.snapshotItem(i);
-                    let event = new MouseEvent('click', {
-                        view: window,
-                        bubbles: true,
-                        cancelable: true
+                function triggerEvents(el) {
+                    const events = ['mousedown', 'mouseup', 'click'];
+                    events.forEach(eventType => {
+                        const event = new MouseEvent(eventType, {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window
+                        });
+                        el.dispatchEvent(event);
                     });
-                    btn.dispatchEvent(event);
+                }
+
+                // Find all elements containing "Show more"
+                const xpath = "//*[contains(text(), 'Show more')]";
+                const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                
+                for (let i = 0; i < result.snapshotLength; i++) {
+                    let el = result.snapshotItem(i);
+                    // 1. Click the text itself
+                    triggerEvents(el);
+                    // 2. Click the parent (often the button wrapper)
+                    if (el.parentElement) triggerEvents(el.parentElement);
+                    // 3. Click the grandparent (just in case)
+                    if (el.parentElement && el.parentElement.parentElement) triggerEvents(el.parentElement.parentElement);
                 }
             """)
-            time.sleep(3) # Wait for React to render new items
+            time.sleep(4) # Wait for expansion
         except Exception as e:
-            result["Notes"] += f" (JS Error: {str(e)})"
+            result["Notes"] += f" (Click failed: {str(e)})"
         # ----------------------------------------
 
         # 3. Capture Screenshot
@@ -86,11 +102,11 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
         soup = BeautifulSoup(driver.page_source, "html.parser")
         page_text = soup.get_text(separator="  ") 
         
-        # 5. Search Logic
+        # 5. Search Logic (Smart Proximity)
         keyword_matches = [m.start() for m in re.finditer(re.escape(target_keyword), page_text, re.IGNORECASE)]
         
         if not keyword_matches:
-            result["Notes"] = f"Keyword '{target_keyword}' not found (Check screenshot if list expanded)."
+            result["Notes"] = f"Keyword '{target_keyword}' not found (List might still be collapsed)."
         else:
             found_amount = False
             for match_index in keyword_matches:
@@ -98,7 +114,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
                 start_slice = max(0, match_index - 150)
                 text_chunk = page_text[start_slice:match_index]
                 
-                # Regex: Number ... SUI
+                # Regex: Number -> Optional Space -> SUI
                 amount_pattern = re.compile(r"([\-\d\.,]+)\s*SUI", re.IGNORECASE)
                 matches_in_chunk = list(amount_pattern.finditer(text_chunk))
                 
@@ -110,8 +126,9 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
                     break 
             
             if not found_amount:
+                # Debug snippet
                 snippet = page_text[max(0, keyword_matches[0]-50) : keyword_matches[0]]
-                result["Notes"] = f"Found '{target_keyword}' but couldn't link amount. Context: '...{snippet}...'"
+                result["Notes"] = f"Found '{target_keyword}' but amount not linked. Context: '...{snippet}...'"
 
     except Exception as e:
         result["Status"] = "Error"
@@ -121,8 +138,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
-
-st.title("🔍 SuiScan Transaction Extractor")
+st.title("🔍 SuiScan Transaction Extractor (Event Injector)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
@@ -195,4 +211,4 @@ if uploaded_file:
                     mime='text/csv',
                 )
             else:
-                st.error("⚠️ Browser Error: Could not start Chrome.")
+                st.error("⚠️ Browser Error: Could not start Chrome. Check logs.")
