@@ -36,48 +36,46 @@ def get_driver():
 
     return webdriver.Chrome(service=service, options=options)
 
-def smart_click(driver, xpath_list):
+def clean_page_layout(driver):
     """
-    Finds an element. Checks if it's covered by a banner/header.
-    Deletes the covering element. Clicks.
+    Deletes headers/footers/widgets to prevent click interception.
     """
-    for xpath in xpath_list:
-        try:
-            elements = driver.find_elements(By.XPATH, xpath)
-            for btn in elements:
-                if btn.is_displayed():
-                    # 1. Scroll to center
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", btn)
-                    time.sleep(1)
-                    
-                    # 2. OBSTACLE REMOVAL LOOP
-                    # We check 3 times if something is covering our button
-                    for _ in range(3):
-                        is_covered = driver.execute_script("""
-                            var el = arguments[0];
-                            var rect = el.getBoundingClientRect();
-                            var x = rect.left + rect.width/2;
-                            var y = rect.top + rect.height/2;
-                            var topEl = document.elementFromPoint(x, y);
-                            
-                            // If the top element is NOT our button (or a descendant), delete it
-                            if (topEl && !el.contains(topEl) && !topEl.contains(el)) {
-                                topEl.remove(); // DELETE THE OBSTACLE
-                                return true;
-                            }
-                            return false;
-                        """, btn)
-                        
-                        if is_covered:
-                            time.sleep(0.5) # Wait for deletion to render
-                        else:
-                            break
-                    
-                    # 3. Force Click (JavaScipt)
-                    driver.execute_script("arguments[0].click();", btn)
-                    return True
-        except Exception:
-            continue
+    driver.execute_script("""
+        document.querySelectorAll('header, footer, #onetrust-banner-sdk, .intercom-lightweight-app, [class*="sticky"], [class*="fixed"]').forEach(el => el.remove());
+    """)
+    time.sleep(0.5)
+
+def recursive_click(driver):
+    """
+    Finds 'Show more' and clicks:
+    1. The element itself
+    2. The Parent
+    3. The Grandparent
+    This solves React 'wrapper click' issues.
+    """
+    try:
+        # Find all elements containing the text "Show more"
+        xpath = "//*[contains(text(), 'Show more')]"
+        elements = driver.find_elements(By.XPATH, xpath)
+        
+        for el in elements:
+            if el.is_displayed():
+                # Highlight for debug screenshot
+                driver.execute_script("arguments[0].style.border='3px solid red'", el)
+                
+                # Scroll to it
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", el)
+                time.sleep(1)
+                
+                # CLICK BLITZ: Click element, then parent, then grandparent
+                driver.execute_script("arguments[0].click();", el) # Click text
+                driver.execute_script("arguments[0].parentElement.click();", el) # Click wrapper
+                driver.execute_script("arguments[0].parentElement.parentElement.click();", el) # Click container
+                
+                time.sleep(2)
+                return True
+    except Exception:
+        pass
     return False
 
 def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
@@ -99,27 +97,15 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
     try:
         # 1. Wait for body
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(5) 
+        time.sleep(4) 
         
-        # 2. Zoom out to see more (prevents scroll issues)
-        driver.execute_script("document.body.style.zoom='50%'")
-        time.sleep(1)
-
-        # 3. SMART CLICK LOGIC
-        # We look for "Show more" text OR the specific class for the expander
-        candidates = [
-            "//*[contains(text(), 'Show more')]",
-            "//div[contains(@class, 'cursor-pointer') and contains(., 'Show more')]"
-        ]
+        # 2. Clean Layout
+        clean_page_layout(driver)
         
-        clicked = smart_click(driver, candidates)
+        # 3. RECURSIVE CLICK
+        recursive_click(driver)
         
-        if clicked:
-            time.sleep(3) # Wait for expansion
-        else:
-            result["Notes"] += " (Warning: Show more button not found/clickable)"
-
-        # 4. Capture Screenshot
+        # 4. Capture Screenshot (Check for red border to confirm finding)
         if debug_mode:
             screenshot = driver.get_screenshot_as_png()
 
@@ -162,7 +148,7 @@ def scrape_suiscan(driver, tx_hash, target_keyword, debug_mode):
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="SuiScan Data Extractor", page_icon="🔍")
-st.title("🔍 SuiScan Extractor (Obstacle Destroyer)")
+st.title("🔍 SuiScan Extractor (Recursive Click)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
